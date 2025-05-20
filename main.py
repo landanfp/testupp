@@ -23,11 +23,12 @@ from plugins.custom_thumbnail import Mdata01, Mdata02, Mdata03, Gthumb01, Gthumb
 
 # --- Logging setup ---
 # Set logging level to INFO for normal operation, DEBUG for detailed debugging
-logging.basicConfig(level=logging.DEBUG, # <<<--- این خط رو به DEBUG تغییر بدید
+logging.basicConfig(level=logging.INFO, # Changed back to INFO for less verbose output in production
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logging.getLogger("pyrogram").setLevel(logging.INFO) # Pyrogram logs are still important, but less verbose than DEBUG
-logging.getLogger("yt_dlp").setLevel(logging.WARNING) # yt-dlp logs are often too verbose, keep at WARNING
+logging.getLogger("pyrogram").setLevel(logging.WARNING) # Reduce Pyrogram log verbosity
+logging.getLogger("yt_dlp").setLevel(logging.WARNING) # Reduce yt-dlp log verbosity
+
 # --- GLOBAL STORAGE FOR TEMPORARY URLs (IN-MEMORY) ---
 # NOTE: This will clear upon bot restart. For persistence, use a database (SQLite, Redis, etc.)
 temp_url_storage = {}
@@ -231,7 +232,8 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     # del temp_url_storage[temp_key] 
 
     user = await bot.get_me()
-  mention = user.mention
+    # FIX: Corrected way to access 'mention' attribute from Pyrogram User object
+    mention = user.mention # Changed from user["mention"] to user.mention
     description = Translation.TECH_VJ_CUSTOM_CAPTION_UL_FILE.format(mention)
     start_time_download = datetime.now() # Start time for download
 
@@ -366,17 +368,12 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                             upload_start_time
                         )
                     )
-                # Video Message (circular video) logic, needs specific conditions for `vm` type
-                # For now, it will default to 'video' if it's a video file, which is more common.
-                # If you specifically want to send circular videos, you'd need a way to detect/request it.
-                # For this example, I'll remove the explicit "vm" check unless you have a way to set it.
-                # If it's a general video file, it should go to 'video' logic.
                 elif tg_send_type == "video":
                     # Check if it's potentially a video note by checking aspect ratio and file size/duration
                     # This is an heuristic and might not be perfect
                     width, height, duration = await Mdata01(downloaded_file_path)
                     
-                    # Heuristic for video note (circular video): width == height and duration < 60 seconds
+                    # Heuristic for video note (circular video): width == height and duration <= 60 seconds
                     # Telegram video notes are usually square (width=height) and max 1 minute.
                     is_video_note = (width and height and width == height and duration <= 60)
 
