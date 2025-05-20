@@ -23,12 +23,11 @@ from plugins.custom_thumbnail import Mdata01, Mdata02, Mdata03, Gthumb01, Gthumb
 
 # --- Logging setup ---
 # Set logging level to INFO for normal operation, DEBUG for detailed debugging
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=logging.DEBUG, # <<<--- این خط رو به DEBUG تغییر بدید
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logging.getLogger("pyrogram").setLevel(logging.WARNING) # Reduce Pyrogram log verbosity
-logging.getLogger("yt_dlp").setLevel(logging.WARNING) # Reduce yt-dlp log verbosity
-
+logging.getLogger("pyrogram").setLevel(logging.INFO) # Pyrogram logs are still important, but less verbose than DEBUG
+logging.getLogger("yt_dlp").setLevel(logging.WARNING) # yt-dlp logs are often too verbose, keep at WARNING
 # --- GLOBAL STORAGE FOR TEMPORARY URLs (IN-MEMORY) ---
 # NOTE: This will clear upon bot restart. For persistence, use a database (SQLite, Redis, etc.)
 temp_url_storage = {}
