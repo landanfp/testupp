@@ -231,7 +231,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     # del temp_url_storage[temp_key] 
 
     user = await bot.get_me()
-    mention = user["mention"]
+  mention = user.mention
     description = Translation.TECH_VJ_CUSTOM_CAPTION_UL_FILE.format(mention)
     start_time_download = datetime.now() # Start time for download
 
