@@ -22,11 +22,11 @@ from translation import Translation
 from plugins.custom_thumbnail import Mdata01, Mdata02, Mdata03, Gthumb01, Gthumb02, delete_temp_file
 
 # --- Logging setup ---
-logging.basicConfig(level=logging.INFO, # Changed to INFO for less verbose output in production
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logging.getLogger("pyrogram").setLevel(logging.WARNING) # Reduce Pyrogram log verbosity
-logging.getLogger("yt_dlp").setLevel(logging.WARNING) # Reduce yt-dlp log verbosity
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("yt_dlp").setLevel(logging.WARNING)
 
 # --- GLOBAL STORAGE FOR TEMPORARY URLs (IN-MEMORY) ---
 temp_url_storage = {}
@@ -102,7 +102,7 @@ class Button(object):
                                             InlineKeyboardButton(text="🔍 ꜱᴇᴀʀᴄʜ", switch_inline_query_current_chat="2 ") ],
                                           [ InlineKeyboardButton(text="📁 1337x", callback_data='00'),
                                             InlineKeyboardButton(text="🔍 ꜱᴇᴀʀᴄʜ", switch_inline_query_current_chat="3 " ) ],
-                                          [ InlineKeyboardButton(text="�� ThePirateBay", callback_data='00'),
+                                          [ InlineKeyboardButton(text="📁 ThePirateBay", callback_data='00'),
                                             InlineKeyboardButton(text="🔍 ꜱᴇᴀʀᴄʜ", switch_inline_query_current_chat="4 ") ],
                                           [ InlineKeyboardButton(text="❌", callback_data="X0") ] ] )
 
@@ -206,17 +206,15 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
         return
     
     user = await bot.get_me()
-    # FIX: Ensure 'mention' exists, otherwise use a default value (e.g., bot's first name or a generic "MyBot")
-    # This prevents KeyError if the bot doesn't have a username or Pyrogram can't retrieve it.
     if user and user.mention:
         mention = user.mention
     elif user and user.first_name:
-        mention = user.first_name # Use bot's first name if mention is not available
+        mention = user.first_name
     else:
-        mention = "ربات" # Fallback to a generic name
+        mention = "ربات"
         logger.warning("Could not get bot's mention or first name. Using generic 'ربات'.")
 
-    description = Translation.TECH_VJ_CUSTOM_CAPTION_UL_FILE.format(mention=mention) # Pass as keyword argument
+    description = Translation.TECH_VJ_CUSTOM_CAPTION_UL_FILE.format(mention=mention)
 
     start_time_download = datetime.now()
 
@@ -234,13 +232,18 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
 
     output_template = os.path.join(tmp_directory_for_each_user, '%(title)s.%(ext)s')
 
+    # Get the event loop instance
+    loop = asyncio.get_running_loop()
+
     ydl_opts_download = {
         'format': youtube_dl_format,
         'outtmpl': output_template,
         'cachedir': False,
         'noplaylist': True,
         'logger': logger,
-        'progress_hooks': [lambda d: asyncio.create_task(
+        # FIX: Use run_coroutine_threadsafe to schedule the progress hook
+        'progress_hooks': [lambda d: loop.call_soon_threadsafe(
+            asyncio.create_task, # Create task in the main event loop
             yt_dlp_progress_hook(d, bot, update.message.chat.id, update.message.id, start_time_download.timestamp())
         )],
         'prefer_ffmpeg': True,
@@ -254,6 +257,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     downloaded_file_path = None
     try:
         with youtube_dl.YoutubeDL(ydl_opts_download) as ydl:
+            # The actual download occurs here
             info_dict = await asyncio.to_thread(lambda: ydl.extract_info(youtube_dl_url, download=True))
             downloaded_file_path = await asyncio.to_thread(ydl.prepare_filename, info_dict)
             download_success = True
