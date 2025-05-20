@@ -8,23 +8,22 @@ import uuid # Required for generating unique keys
 # Pyrogram imports
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
-from pyrogram.errors import MessageNotModified, FloodWait
+from pyrogram.errors import MessageNotModified, FloodWait, RPCError
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 
 # For yt-dlp
 import yt_dlp as youtube_dl
 
 # Import configurations and translations
-# Ensure config.py and translation.py are in the same directory or correctly imported
 from config import Config
 from translation import Translation
 
 # Import custom thumbnail and metadata functions
-# Ensure plugins/custom_thumbnail.py exists and functions are correctly defined
 from plugins.custom_thumbnail import Mdata01, Mdata02, Mdata03, Gthumb01, Gthumb02, delete_temp_file
 
 # --- Logging setup ---
-logging.basicConfig(level=logging.INFO, # Changed to INFO for less verbose output by default
+# Set logging level to INFO for normal operation, DEBUG for detailed debugging
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logging.getLogger("pyrogram").setLevel(logging.WARNING) # Reduce Pyrogram log verbosity
@@ -44,6 +43,7 @@ async def progress_for_pyrogram(
 ):
     now = time.time()
     diff = now - start_time
+    # Update progress every 5 seconds or if download/upload is complete
     if round(diff % 5.00) == 0 or current == total:
         if diff == 0: # Avoid division by zero
             return
@@ -63,14 +63,17 @@ async def progress_for_pyrogram(
                           f"**ETA:** {estimated_total_time_str}"
 
         try:
+            # Use edit_text to update the message, ensuring it's not the same to avoid flood waits
             await message.edit_text(current_message)
         except MessageNotModified:
-            pass # Ignore if message content hasn't changed
-        except FloodWait as e: # Handle FloodWait (rate limit)
-            logger.warning(f"FloodWait encountered: {e.value} seconds. Waiting...")
+            pass # Ignore if message content hasn't changed to prevent unnecessary API calls
+        except FloodWait as e: # Handle Telegram's rate limit
+            logger.warning(f"FloodWait encountered while updating progress: {e.value} seconds. Waiting...")
             await asyncio.sleep(e.value)
+        except RPCError as e: # Catch other Pyrogram specific errors
+            logger.error(f"Pyrogram RPCError during progress update: {e}")
         except Exception as e:
-            logger.warning(f"Error updating progress message: {e}")
+            logger.warning(f"General error updating progress message: {e}")
 
 def humanbytes(size):
     if not size:
@@ -123,8 +126,9 @@ async def process_url_for_qualities(bot: Client, message: Message):
             'noplaylist': True, # Do not process playlists (only first item)
             'logger': logger # Use custom logger
         }
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=False)
+        
+        # Use asyncio.to_thread for blocking yt-dlp operation to not block the event loop
+        info_dict = await asyncio.to_thread(lambda: youtube_dl.YoutubeDL(ydl_opts).extract_info(url, download=False))
 
         # If it's a playlist or multiple entries, select the first entry.
         if 'entries' in info_dict and info_dict['entries']:
@@ -155,7 +159,8 @@ async def process_url_for_qualities(bot: Client, message: Message):
 
             # Basic filtering: only video and audio formats that are mp4/mkv/webm and have a specific height.
             # Also, filter out formats with "none" video or audio codec unless it's explicitly audio or video only.
-            if vcodec != 'none' and acodec != 'none' and height and ext in ['mp4', 'mkv', 'webm']:
+            # Ensure both video and audio streams are present for a complete video file
+            if (vcodec != 'none' and acodec != 'none' and height) and ext in ['mp4', 'mkv', 'webm']:
                 quality_label = f"{height}p"
                 if fps:
                     quality_label += f"@{int(fps)}fps" # Display frames per second
@@ -168,10 +173,12 @@ async def process_url_for_qualities(bot: Client, message: Message):
                 # callback_data format: dl_q=FORMAT_ID=EXT=TEMP_KEY
                 # 'dl_q' is a shortened prefix for 'download_quality' to save bytes
                 callback_data = f"dl_q={format_id}={ext}={temp_key}"
-                # Telegram callback_data limit is 64 bytes.
-                # If this callback_data length becomes an issue (e.g. format_id is too long),
-                # further shortening or using a database for format_id and ext is needed.
-                # Currently, format_id and ext are usually short, so this should fit.
+                
+                # Check if callback_data length exceeds Telegram's 64-byte limit
+                # If so, this format won't be offered to prevent the error
+                if len(callback_data.encode('utf-8')) > 64:
+                    logger.warning(f"Callback data too long ({len(callback_data.encode('utf-8'))} bytes) for format {format_id}. Skipping.")
+                    continue
 
                 available_qualities[quality_label] = callback_data
 
@@ -194,20 +201,20 @@ async def process_url_for_qualities(bot: Client, message: Message):
         logger.error(f"YoutubeDL Error processing URL {url}: {e}")
         await sent_message.edit_text(f"خطا در پردازش لینک (YoutubeDL): {e}")
     except Exception as e:
-        logger.error(f"General error processing URL {url}: {e}")
+        logger.error(f"General error processing URL {url}: {e}", exc_info=True) # exc_info=True for full traceback
         await sent_message.edit_text(f"هنگام پردازش لینک شما خطایی رخ داد: {e}")
 
 # --- Handler for quality selection Callback Queries ---
 @Client.on_callback_query(filters.regex(r"^dl_q=")) # Regex checks for callback data starting with 'dl_q='
 async def ddl_call_back(bot: Client, update: CallbackQuery):
-    logger.info(f"Callback received: {update.data}")
+    logger.info(f"Callback received: {update.data} from user {update.from_user.id}")
     cb_data = update.data
 
     # Parse callback_data: dl_q=FORMAT_ID=EXT=TEMP_KEY
     try:
         _, youtube_dl_format, youtube_dl_ext, temp_key = cb_data.split("=", 3)
     except ValueError as e:
-        logger.error(f"Error parsing callback data: {cb_data} - {e}")
+        logger.error(f"Error parsing callback data: {cb_data} - {e}", exc_info=True)
         await update.message.edit_text("خطا در پردازش اطلاعات دکمه. لطفاً دوباره امتحان کنید.")
         return
 
@@ -215,12 +222,13 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     youtube_dl_url = temp_url_storage.get(temp_key)
     if not youtube_dl_url:
         await update.message.edit_text("خطا: لینک اصلی پیدا نشد یا منقضی شده است. لطفاً دوباره امتحان کنید یا لینک جدیدی ارسال کنید.")
-        logger.warning(f"URL not found in temp_url_storage for key: {temp_key}. Bot might have restarted.")
+        logger.warning(f"URL not found in temp_url_storage for key: {temp_key}. Bot might have restarted or key expired.")
         return
     
     # Optional: Delete the URL from storage if you want it to be used only once
     # For now, we'll keep it to allow multiple quality downloads from the same message if needed.
     # If using a persistent DB, consider a cleanup strategy (e.g., after successful upload or after a timeout)
+    # If you choose to delete, consider potential race conditions if user clicks multiple buttons quickly
     # del temp_url_storage[temp_key] 
 
     user = await bot.get_me()
@@ -228,7 +236,15 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     description = Translation.TECH_VJ_CUSTOM_CAPTION_UL_FILE.format(mention)
     start_time_download = datetime.now() # Start time for download
 
-    await update.message.edit_text(Translation.DOWNLOAD_START)
+    try:
+        await update.message.edit_text(Translation.DOWNLOAD_START)
+    except MessageNotModified:
+        pass # Message content might be the same, ignore
+    except RPCError as e:
+        logger.error(f"Failed to edit message with DOWNLOAD_START: {e}")
+        # If message cannot be edited, send a new one
+        await bot.send_message(chat_id=update.message.chat.id, text=Translation.DOWNLOAD_START)
+
 
     tmp_directory_for_each_user = os.path.join(Config.TECH_VJ_DOWNLOAD_LOCATION, str(update.from_user.id))
     # Ensure the download directory exists for the user
@@ -257,24 +273,29 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     download_success = False
     downloaded_file_path = None
     try:
+        # Use asyncio.to_thread for blocking yt-dlp download operation
         with youtube_dl.YoutubeDL(ydl_opts_download) as ydl:
-            # extract_info with download=True will download the file
-            info_dict = ydl.extract_info(youtube_dl_url, download=True)
-            # yt-dlp returns the actual path after download and processing
-            downloaded_file_path = ydl.prepare_filename(info_dict)
+            info_dict = await asyncio.to_thread(lambda: ydl.extract_info(youtube_dl_url, download=True))
+            downloaded_file_path = await asyncio.to_thread(ydl.prepare_filename, info_dict)
             download_success = True
     except youtube_dl.DownloadError as e:
-        logger.error(f"Download Error for {youtube_dl_url} (format {youtube_dl_format}): {e}")
+        logger.error(f"Download Error for {youtube_dl_url} (format {youtube_dl_format}): {e}", exc_info=True)
         await update.message.edit_text(f"دانلود با شکست مواجه شد: {e}")
         return
     except Exception as e:
-        logger.error(f"An unexpected error occurred during download: {e}")
+        logger.error(f"An unexpected error occurred during download: {e}", exc_info=True)
         await update.message.edit_text(f"خطای غیرمنتظره‌ای در حین دانلود رخ داد: {e}")
         return
 
     if download_success and downloaded_file_path and os.path.exists(downloaded_file_path):
         end_download_time = datetime.now()
-        await update.message.edit_text(Translation.UPLOAD_START)
+        try:
+            await update.message.edit_text(Translation.UPLOAD_START)
+        except MessageNotModified:
+            pass
+        except RPCError as e:
+            logger.error(f"Failed to edit message with UPLOAD_START: {e}")
+            await bot.send_message(chat_id=update.message.chat.id, text=Translation.UPLOAD_START)
 
         file_size = os.stat(downloaded_file_path).st_size
 
@@ -295,9 +316,9 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
             upload_start_time = time.time() # Start time for upload
 
             # Determine send type (audio/video/file) based on file extension
-            if downloaded_file_path.endswith(('.mp3', '.ogg', '.wav', '.m4a')):
+            if downloaded_file_path.lower().endswith(('.mp3', '.ogg', '.wav', '.m4a')):
                 tg_send_type = "audio"
-            elif downloaded_file_path.endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov')):
+            elif downloaded_file_path.lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov')):
                 tg_send_type = "video"
             else:
                 tg_send_type = "file" # Default to file if unknown
@@ -346,46 +367,56 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                             upload_start_time
                         )
                     )
-                elif tg_send_type == "vm": # Video Message (circular video)
-                    width, duration = await Mdata02(downloaded_file_path)
-                    # Gthumb02 is used for video message thumbnail (generates from video)
-                    thumb_vm_path = await Gthumb02(bot, update, duration, downloaded_file_path)
-                    await bot.send_video_note(
-                        chat_id=update.message.chat.id,
-                        video_note=downloaded_file_path,
-                        duration=duration,
-                        length=width,
-                        thumb=thumb_vm_path,
-                        reply_to_message_id=update.message.reply_to_message.id,
-                        progress=progress_for_pyrogram,
-                        progress_args=(
-                            Translation.TECH_VJ_UPLOAD_START,
-                            update.message,
-                            upload_start_time
-                        )
-                    )
+                # Video Message (circular video) logic, needs specific conditions for `vm` type
+                # For now, it will default to 'video' if it's a video file, which is more common.
+                # If you specifically want to send circular videos, you'd need a way to detect/request it.
+                # For this example, I'll remove the explicit "vm" check unless you have a way to set it.
+                # If it's a general video file, it should go to 'video' logic.
                 elif tg_send_type == "video":
+                    # Check if it's potentially a video note by checking aspect ratio and file size/duration
+                    # This is an heuristic and might not be perfect
                     width, height, duration = await Mdata01(downloaded_file_path)
-                    # Gthumb02 is used for video thumbnail (generates from video)
-                    thumb_video_path = await Gthumb02(bot, update, duration, downloaded_file_path)
-                    await bot.send_video(
-                        chat_id=update.message.chat.id,
-                        video=downloaded_file_path,
-                        caption=description,
-                        duration=duration,
-                        width=width,
-                        height=height,
-                        supports_streaming=True, # Allows streaming on Telegram
-                        thumb=thumb_video_path,
-                        reply_to_message_id=update.message.reply_to_message.id,
-                        progress=progress_for_pyrogram,
-                        progress_args=(
-                            Translation.TECH_VJ_UPLOAD_START,
-                            update.message,
-                            upload_start_time
+                    
+                    # Heuristic for video note (circular video): width == height and duration < 60 seconds
+                    # Telegram video notes are usually square (width=height) and max 1 minute.
+                    is_video_note = (width and height and width == height and duration <= 60)
+
+                    if is_video_note:
+                        thumb_vm_path = await Gthumb02(bot, update, duration, downloaded_file_path)
+                        await bot.send_video_note(
+                            chat_id=update.message.chat.id,
+                            video_note=downloaded_file_path,
+                            duration=duration,
+                            length=width, # Length is width/height for video note
+                            thumb=thumb_vm_path,
+                            reply_to_message_id=update.message.reply_to_message.id,
+                            progress=progress_for_pyrogram,
+                            progress_args=(
+                                Translation.TECH_VJ_UPLOAD_START,
+                                update.message,
+                                upload_start_time
+                            )
                         )
-                    )
-                else:
+                    else:
+                        thumb_video_path = await Gthumb02(bot, update, duration, downloaded_file_path)
+                        await bot.send_video(
+                            chat_id=update.message.chat.id,
+                            video=downloaded_file_path,
+                            caption=description,
+                            duration=duration,
+                            width=width,
+                            height=height,
+                            supports_streaming=True, # Allows streaming on Telegram
+                            thumb=thumb_video_path,
+                            reply_to_message_id=update.message.reply_to_message.id,
+                            progress=progress_for_pyrogram,
+                            progress_args=(
+                                Translation.TECH_VJ_UPLOAD_START,
+                                update.message,
+                                upload_start_time
+                            )
+                        )
+                else: # Fallback for unknown types or if video type is not handled by above
                     logger.info("Unknown send type. Sending file as document.")
                     await bot.send_document(
                         chat_id=update.message.chat.id,
@@ -401,7 +432,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                         )
                     )
             except Exception as e:
-                logger.error(f"Error during file upload: {e}")
+                logger.error(f"Error during file upload: {e}", exc_info=True)
                 await update.message.edit_text(f"خطا در آپلود فایل: {e}")
                 return
 
@@ -420,7 +451,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                     await delete_temp_file(thumb_video_path)
 
                 # Optionally, clean up the user's download directory if empty
-                if not os.listdir(tmp_directory_for_each_user):
+                if os.path.exists(tmp_directory_for_each_user) and not os.listdir(tmp_directory_for_each_user):
                     await asyncio.to_thread(os.rmdir, tmp_directory_for_each_user)
                     logger.info(f"Removed empty user directory: {tmp_directory_for_each_user}")
 
@@ -468,20 +499,24 @@ async def yt_dlp_progress_hook(d: dict, bot: Client, chat_id: int, message_id: i
                               f"**سرعت:** {current_speed}/s\n" \
                               f"**زمان باقیمانده (ETA):** {estimated_time_str}"
             try:
+                # Use edit_text to update the message
                 await bot.edit_message_text(chat_id, message_id, text=current_message)
             except MessageNotModified:
                 pass # Ignore if message content hasn't changed
             except FloodWait as e:
                 logger.warning(f"FloodWait on progress update: {e.value} seconds. Waiting...")
                 await asyncio.sleep(e.value)
+            except RPCError as e:
+                logger.error(f"Pyrogram RPCError during yt-dlp progress update: {e}")
             except Exception as e:
-                logger.warning(f"Error updating yt-dlp progress message: {e}")
+                logger.warning(f"General error updating yt-dlp progress message: {e}")
     elif d['status'] == 'finished':
         logger.info(f"Download finished for {d.get('filename', 'unknown file')}")
 
 
 # --- Bot initialization and execution ---
 if __name__ == "__main__":
+    # Ensure the plugins directory exists and custom_thumbnail.py is inside it
     plugins_path = dict(root="plugins")
 
     app = Client(
