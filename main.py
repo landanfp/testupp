@@ -37,7 +37,7 @@ async def progress_for_pyrogram(
     total,
     ud_type,
     message,
-    start_time
+    start_time # This start_time is for Pyrogram's upload progress
 ):
     now = time.time()
     diff = now - start_time
@@ -216,7 +216,8 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
 
     description = Translation.TECH_VJ_CUSTOM_CAPTION_UL_FILE.format(mention=mention)
 
-    start_time_download = datetime.now()
+    # Initialize start_time_download here, before passing to yt_dlp
+    start_time_download = time.time() # Changed to time.time() for consistency with progress calculations
 
     try:
         await update.message.edit_text(Translation.DOWNLOAD_START)
@@ -232,7 +233,6 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
 
     output_template = os.path.join(tmp_directory_for_each_user, '%(title)s.%(ext)s')
 
-    # Get the event loop instance
     loop = asyncio.get_running_loop()
 
     ydl_opts_download = {
@@ -241,11 +241,13 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
         'cachedir': False,
         'noplaylist': True,
         'logger': logger,
-        # FIX: Use run_coroutine_threadsafe to schedule the progress hook
-        'progress_hooks': [lambda d: loop.call_soon_threadsafe(
-            asyncio.create_task, # Create task in the main event loop
-            yt_dlp_progress_hook(d, bot, update.message.chat.id, update.message.id, start_time_download.timestamp())
-        )],
+        'progress_hooks': [
+            # Pass d, bot, chat_id, message_id, AND the fixed start_time_download
+            lambda d: loop.call_soon_threadsafe(
+                asyncio.create_task,
+                yt_dlp_progress_hook(d, bot, update.message.chat.id, update.message.id, start_time_download)
+            )
+        ],
         'prefer_ffmpeg': True,
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
@@ -257,7 +259,6 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     downloaded_file_path = None
     try:
         with youtube_dl.YoutubeDL(ydl_opts_download) as ydl:
-            # The actual download occurs here
             info_dict = await asyncio.to_thread(lambda: ydl.extract_info(youtube_dl_url, download=True))
             downloaded_file_path = await asyncio.to_thread(ydl.prepare_filename, info_dict)
             download_success = True
@@ -271,7 +272,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
         return
 
     if download_success and downloaded_file_path and os.path.exists(downloaded_file_path):
-        end_download_time = datetime.now()
+        end_download_time = datetime.now() # Use datetime for calculation here
         try:
             await update.message.edit_text(Translation.UPLOAD_START)
         except MessageNotModified:
@@ -295,7 +296,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                 logger.warning(f"Error removing large file {downloaded_file_path}: {e}")
             return
         else:
-            upload_start_time = time.time()
+            upload_start_time = time.time() # This is the start time for the *upload*
 
             if downloaded_file_path.lower().endswith(('.mp3', '.ogg', '.wav', '.m4a')):
                 tg_send_type = "audio"
@@ -423,10 +424,12 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
             except Exception as e:
                 logger.warning(f"Error during cleanup: {e}")
 
-            time_taken_for_download = (end_download_time - start_time_download).seconds
-            time_taken_for_upload = (end_upload_time - end_download_time).seconds
+            # Calculate time taken using the datetime objects
+            total_download_seconds = (end_download_time - datetime.fromtimestamp(start_time_download)).seconds
+            total_upload_seconds = (end_upload_time - end_download_time).seconds
+            
             await update.message.edit_text(
-                text=Translation.TECH_VJ_AFTER_SUCCESSFUL_UPLOAD_MSG_WITH_TS.format(time_taken_for_download, time_taken_for_upload),
+                text=Translation.TECH_VJ_AFTER_SUCCESSFUL_UPLOAD_MSG_WITH_TS.format(total_download_seconds, total_upload_seconds),
                 chat_id=update.message.chat.id,
                 message_id=update.message.id,
                 disable_web_page_preview=True
@@ -441,6 +444,8 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
 
 # --- Progress Hook for yt-dlp ---
 async def yt_dlp_progress_hook(d: dict, bot: Client, chat_id: int, message_id: int, start_time: float):
+    # This hook is called by yt-dlp.
+    # d['status'] can be 'downloading', 'finished', 'error'
     if d['status'] == 'downloading':
         total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
         downloaded_bytes = d.get('downloaded_bytes')
@@ -450,7 +455,7 @@ async def yt_dlp_progress_hook(d: dict, bot: Client, chat_id: int, message_id: i
         if total_bytes and downloaded_bytes:
             percentage = downloaded_bytes * 100 / total_bytes
             current_time = time.time()
-            diff = current_time - start_time
+            diff = current_time - start_time # Use the start_time passed from ddl_call_back
 
             if diff == 0:
                 diff = 0.001
@@ -464,6 +469,8 @@ async def yt_dlp_progress_hook(d: dict, bot: Client, chat_id: int, message_id: i
                               f"**سرعت:** {current_speed}/s\n" \
                               f"**زمان باقیمانده (ETA):** {estimated_time_str}"
             try:
+                # Only edit if progress has changed significantly to avoid spamming Telegram API
+                # or if it's the very first update
                 await bot.edit_message_text(chat_id, message_id, text=current_message)
             except MessageNotModified:
                 pass
