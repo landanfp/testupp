@@ -1,42 +1,40 @@
-# main.py
-
 import logging
 import asyncio
 import os
 import time
 from datetime import datetime
-import uuid # <<<--- اضافه کنید
-# import json # برای دیتابیس ساده JSON در صورت نیاز به پایداری بیشتر از رم
-# import shelve # یا shelve برای دیتابیس ساده key-value
+import uuid # Required for generating unique keys
 
 # Pyrogram imports
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
-from pyrogram.errors import MessageNotModified
+from pyrogram.errors import MessageNotModified, FloodWait
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 
 # For yt-dlp
 import yt_dlp as youtube_dl
 
 # Import configurations and translations
+# Ensure config.py and translation.py are in the same directory or correctly imported
 from config import Config
 from translation import Translation
 
 # Import custom thumbnail and metadata functions
+# Ensure plugins/custom_thumbnail.py exists and functions are correctly defined
 from plugins.custom_thumbnail import Mdata01, Mdata02, Mdata03, Gthumb01, Gthumb02, delete_temp_file
 
 # --- Logging setup ---
-logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(level=logging.INFO, # Changed to INFO for less verbose output by default
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("pyrogram").setLevel(logging.WARNING) # Reduce Pyrogram log verbosity
+logging.getLogger("yt_dlp").setLevel(logging.WARNING) # Reduce yt-dlp log verbosity
 
 # --- GLOBAL STORAGE FOR TEMPORARY URLs (IN-MEMORY) ---
 # NOTE: This will clear upon bot restart. For persistence, use a database (SQLite, Redis, etc.)
 temp_url_storage = {}
 
 # --- Helper functions for progress display ---
-# ... (humanbytes, TimeFormatter, progress_for_pyrogram, yt_dlp_progress_hook - same as before)
 async def progress_for_pyrogram(
     current,
     total,
@@ -68,6 +66,9 @@ async def progress_for_pyrogram(
             await message.edit_text(current_message)
         except MessageNotModified:
             pass # Ignore if message content hasn't changed
+        except FloodWait as e: # Handle FloodWait (rate limit)
+            logger.warning(f"FloodWait encountered: {e.value} seconds. Waiting...")
+            await asyncio.sleep(e.value)
         except Exception as e:
             logger.warning(f"Error updating progress message: {e}")
 
@@ -94,8 +95,7 @@ def TimeFormatter(milliseconds: int) -> str:
           ((str(milliseconds) + "ms, ") if milliseconds else "")
     return tmp[:-2]
 
-
-# --- Button Class (If you have a main menu, keep this) ---
+# --- Button Class (Example, can be removed if not used) ---
 class Button(object):
       BUTTONS01 = InlineKeyboardMarkup( [ [ InlineKeyboardButton(text="📁 YTS", callback_data='00'),
                                             InlineKeyboardButton(text="🔍 ꜱᴇᴀʀᴄʜ", switch_inline_query_current_chat="1 ") ],
@@ -154,6 +154,7 @@ async def process_url_for_qualities(bot: Client, message: Message):
             acodec = f.get('acodec')
 
             # Basic filtering: only video and audio formats that are mp4/mkv/webm and have a specific height.
+            # Also, filter out formats with "none" video or audio codec unless it's explicitly audio or video only.
             if vcodec != 'none' and acodec != 'none' and height and ext in ['mp4', 'mkv', 'webm']:
                 quality_label = f"{height}p"
                 if fps:
@@ -167,6 +168,11 @@ async def process_url_for_qualities(bot: Client, message: Message):
                 # callback_data format: dl_q=FORMAT_ID=EXT=TEMP_KEY
                 # 'dl_q' is a shortened prefix for 'download_quality' to save bytes
                 callback_data = f"dl_q={format_id}={ext}={temp_key}"
+                # Telegram callback_data limit is 64 bytes.
+                # If this callback_data length becomes an issue (e.g. format_id is too long),
+                # further shortening or using a database for format_id and ext is needed.
+                # Currently, format_id and ext are usually short, so this should fit.
+
                 available_qualities[quality_label] = callback_data
 
         if not available_qualities:
@@ -192,37 +198,44 @@ async def process_url_for_qualities(bot: Client, message: Message):
         await sent_message.edit_text(f"هنگام پردازش لینک شما خطایی رخ داد: {e}")
 
 # --- Handler for quality selection Callback Queries ---
-@Client.on_callback_query(filters.regex(r"^dl_q=")) # <<<--- Regex changed to 'dl_q='
+@Client.on_callback_query(filters.regex(r"^dl_q=")) # Regex checks for callback data starting with 'dl_q='
 async def ddl_call_back(bot: Client, update: CallbackQuery):
     logger.info(f"Callback received: {update.data}")
     cb_data = update.data
 
-    # parsing callback_data: dl_q=FORMAT_ID=EXT=TEMP_KEY
-    _, youtube_dl_format, youtube_dl_ext, temp_key = cb_data.split("=", 3)
+    # Parse callback_data: dl_q=FORMAT_ID=EXT=TEMP_KEY
+    try:
+        _, youtube_dl_format, youtube_dl_ext, temp_key = cb_data.split("=", 3)
+    except ValueError as e:
+        logger.error(f"Error parsing callback data: {cb_data} - {e}")
+        await update.message.edit_text("خطا در پردازش اطلاعات دکمه. لطفاً دوباره امتحان کنید.")
+        return
 
     # --- Retrieve the original URL from temp_url_storage ---
     youtube_dl_url = temp_url_storage.get(temp_key)
     if not youtube_dl_url:
         await update.message.edit_text("خطا: لینک اصلی پیدا نشد یا منقضی شده است. لطفاً دوباره امتحان کنید یا لینک جدیدی ارسال کنید.")
+        logger.warning(f"URL not found in temp_url_storage for key: {temp_key}. Bot might have restarted.")
         return
     
     # Optional: Delete the URL from storage if you want it to be used only once
-    # However, if a user might want to download multiple qualities from the same message,
-    # don't delete it. Consider a scheduled cleanup or a persistent DB.
-    # del temp_url_storage[temp_key] # Consider if you need to retain for other downloads
+    # For now, we'll keep it to allow multiple quality downloads from the same message if needed.
+    # If using a persistent DB, consider a cleanup strategy (e.g., after successful upload or after a timeout)
+    # del temp_url_storage[temp_key] 
 
     user = await bot.get_me()
     mention = user["mention"]
     description = Translation.TECH_VJ_CUSTOM_CAPTION_UL_FILE.format(mention)
-    start_time = datetime.now() # Start time for download
+    start_time_download = datetime.now() # Start time for download
 
     await update.message.edit_text(Translation.DOWNLOAD_START)
 
     tmp_directory_for_each_user = os.path.join(Config.TECH_VJ_DOWNLOAD_LOCATION, str(update.from_user.id))
-    if not os.path.isdir(tmp_directory_for_each_user):
-        os.makedirs(tmp_directory_for_each_user)
+    # Ensure the download directory exists for the user
+    os.makedirs(tmp_directory_for_each_user, exist_ok=True)
 
     # Output filename template for yt-dlp
+    # Using %(title)s.%(ext)s to get a descriptive filename. yt-dlp handles conflicts.
     output_template = os.path.join(tmp_directory_for_each_user, '%(title)s.%(ext)s')
 
     ydl_opts_download = {
@@ -232,7 +245,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
         'noplaylist': True,
         'logger': logger,
         'progress_hooks': [lambda d: asyncio.create_task(
-            yt_dlp_progress_hook(d, bot, update.message.chat.id, update.message.id, start_time.timestamp())
+            yt_dlp_progress_hook(d, bot, update.message.chat.id, update.message.id, start_time_download.timestamp())
         )],
         'prefer_ffmpeg': True, # Prefer FFmpeg for merging (e.g., video+audio)
         'postprocessors': [{
@@ -245,7 +258,9 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     downloaded_file_path = None
     try:
         with youtube_dl.YoutubeDL(ydl_opts_download) as ydl:
+            # extract_info with download=True will download the file
             info_dict = ydl.extract_info(youtube_dl_url, download=True)
+            # yt-dlp returns the actual path after download and processing
             downloaded_file_path = ydl.prepare_filename(info_dict)
             download_success = True
     except youtube_dl.DownloadError as e:
@@ -270,13 +285,16 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                 message_id=update.message.id
             )
             try:
-                os.remove(downloaded_file_path)
+                # Use asyncio.to_thread for blocking os.remove
+                await asyncio.to_thread(os.remove, downloaded_file_path)
+                logger.info(f"Removed large file: {downloaded_file_path}")
             except Exception as e:
                 logger.warning(f"Error removing large file {downloaded_file_path}: {e}")
             return
         else:
             upload_start_time = time.time() # Start time for upload
 
+            # Determine send type (audio/video/file) based on file extension
             if downloaded_file_path.endswith(('.mp3', '.ogg', '.wav', '.m4a')):
                 tg_send_type = "audio"
             elif downloaded_file_path.endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov')):
@@ -286,11 +304,17 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
 
             thumb_image_path = None
             try:
-                thumb_image_path = await Gthumb01(bot, update) # This function should return a valid path or None
+                # Gthumb01 is for a custom thumbnail uploaded by user
+                thumb_image_path = await Gthumb01(bot, update) 
             except Exception as e:
-                logger.warning(f"Could not generate thumbnail with Gthumb01: {e}")
+                logger.warning(f"Could not get custom thumbnail with Gthumb01: {e}")
                 thumb_image_path = None # Set to None if error occurs
 
+            # Variables to store dynamically generated thumbnails
+            thumb_vm_path = None
+            thumb_video_path = None
+
+            # --- Upload logic ---
             try:
                 if tg_send_type == "audio":
                     duration = await Mdata03(downloaded_file_path)
@@ -324,6 +348,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                     )
                 elif tg_send_type == "vm": # Video Message (circular video)
                     width, duration = await Mdata02(downloaded_file_path)
+                    # Gthumb02 is used for video message thumbnail (generates from video)
                     thumb_vm_path = await Gthumb02(bot, update, duration, downloaded_file_path)
                     await bot.send_video_note(
                         chat_id=update.message.chat.id,
@@ -341,6 +366,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                     )
                 elif tg_send_type == "video":
                     width, height, duration = await Mdata01(downloaded_file_path)
+                    # Gthumb02 is used for video thumbnail (generates from video)
                     thumb_video_path = await Gthumb02(bot, update, duration, downloaded_file_path)
                     await bot.send_video(
                         chat_id=update.message.chat.id,
@@ -349,7 +375,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                         duration=duration,
                         width=width,
                         height=height,
-                        supports_streaming=True,
+                        supports_streaming=True, # Allows streaming on Telegram
                         thumb=thumb_video_path,
                         reply_to_message_id=update.message.reply_to_message.id,
                         progress=progress_for_pyrogram,
@@ -382,20 +408,26 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
             end_upload_time = datetime.now()
             # --- Cleanup ---
             try:
-                os.remove(downloaded_file_path)
-                # Remove thumbnail if created
+                # Delete the downloaded file
+                await delete_temp_file(downloaded_file_path)
+                
+                # Delete generated thumbnails
                 if thumb_image_path and os.path.exists(thumb_image_path):
-                    await delete_temp_file(thumb_image_path) # Use async function for deletion
-                # Also remove thumbnails generated by Gthumb02 if they exist
-                if 'thumb_vm_path' in locals() and thumb_vm_path and os.path.exists(thumb_vm_path):
-                     await delete_temp_file(thumb_vm_path)
-                if 'thumb_video_path' in locals() and thumb_video_path and os.path.exists(thumb_video_path):
-                     await delete_temp_file(thumb_video_path)
+                    await delete_temp_file(thumb_image_path)
+                if thumb_vm_path and os.path.exists(thumb_vm_path):
+                    await delete_temp_file(thumb_vm_path)
+                if thumb_video_path and os.path.exists(thumb_video_path):
+                    await delete_temp_file(thumb_video_path)
+
+                # Optionally, clean up the user's download directory if empty
+                if not os.listdir(tmp_directory_for_each_user):
+                    await asyncio.to_thread(os.rmdir, tmp_directory_for_each_user)
+                    logger.info(f"Removed empty user directory: {tmp_directory_for_each_user}")
 
             except Exception as e:
                 logger.warning(f"Error during cleanup: {e}")
 
-            time_taken_for_download = (end_download_time - start_time).seconds
+            time_taken_for_download = (end_download_time - start_time_download).seconds
             time_taken_for_upload = (end_upload_time - end_download_time).seconds
             await update.message.edit_text(
                 text=Translation.TECH_VJ_AFTER_SUCCESSFUL_UPLOAD_MSG_WITH_TS.format(time_taken_for_download, time_taken_for_upload),
@@ -439,10 +471,13 @@ async def yt_dlp_progress_hook(d: dict, bot: Client, chat_id: int, message_id: i
                 await bot.edit_message_text(chat_id, message_id, text=current_message)
             except MessageNotModified:
                 pass # Ignore if message content hasn't changed
+            except FloodWait as e:
+                logger.warning(f"FloodWait on progress update: {e.value} seconds. Waiting...")
+                await asyncio.sleep(e.value)
             except Exception as e:
                 logger.warning(f"Error updating yt-dlp progress message: {e}")
     elif d['status'] == 'finished':
-        logger.info(f"Download finished for {d['filename']}")
+        logger.info(f"Download finished for {d.get('filename', 'unknown file')}")
 
 
 # --- Bot initialization and execution ---
@@ -450,16 +485,19 @@ if __name__ == "__main__":
     plugins_path = dict(root="plugins")
 
     app = Client(
-        "my_bot_session",
+        "my_bot_session", # Arbitrary name for the bot session
         bot_token=Config.TG_BOT_TOKEN,
         api_id=Config.APP_ID,
         api_hash=Config.API_HASH,
-        plugins=plugins_path
+        plugins=plugins_path # Loads plugins from 'plugins/' directory
     )
 
+    # Register handlers
+    # Handler for URL messages (starting with http/https) in private chats
     app.add_handler(MessageHandler(process_url_for_qualities, filters.regex(r"^(http|https)://[^\s/$.?#].[^\s]*$") & filters.private))
-    app.add_handler(CallbackQueryHandler(ddl_call_back, filters.regex(r"^dl_q="))) # <<<--- Regex changed here
+    # Handler for Callback Queries (when user clicks on a quality button), specifically those starting with 'dl_q='
+    app.add_handler(CallbackQueryHandler(ddl_call_back, filters.regex(r"^dl_q=")))
 
     logger.info("ربات در حال شروع به کار است...")
-    app.run()
+    app.run() # Run the bot, blocking until termination
     logger.info("ربات متوقف شد.")
