@@ -1,8 +1,13 @@
+# main.py
+
 import logging
 import asyncio
 import os
 import time
 from datetime import datetime
+import uuid # <<<--- اضافه کنید
+# import json # برای دیتابیس ساده JSON در صورت نیاز به پایداری بیشتر از رم
+# import shelve # یا shelve برای دیتابیس ساده key-value
 
 # Pyrogram imports
 from pyrogram import Client, filters
@@ -24,12 +29,14 @@ from plugins.custom_thumbnail import Mdata01, Mdata02, Mdata03, Gthumb01, Gthumb
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logging.getLogger("pyrogram").setLevel(logging.WARNING) # Reduce Pyrogram log verbosity
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
+# --- GLOBAL STORAGE FOR TEMPORARY URLs (IN-MEMORY) ---
+# NOTE: This will clear upon bot restart. For persistence, use a database (SQLite, Redis, etc.)
+temp_url_storage = {}
 
 # --- Helper functions for progress display ---
-# These functions should be defined here or imported from a helper_funcs/display_progress.py file
-# For simplicity, they are included directly here.
-
+# ... (humanbytes, TimeFormatter, progress_for_pyrogram, yt_dlp_progress_hook - same as before)
 async def progress_for_pyrogram(
     current,
     total,
@@ -87,6 +94,7 @@ def TimeFormatter(milliseconds: int) -> str:
           ((str(milliseconds) + "ms, ") if milliseconds else "")
     return tmp[:-2]
 
+
 # --- Button Class (If you have a main menu, keep this) ---
 class Button(object):
       BUTTONS01 = InlineKeyboardMarkup( [ [ InlineKeyboardButton(text="📁 YTS", callback_data='00'),
@@ -126,6 +134,13 @@ async def process_url_for_qualities(bot: Client, message: Message):
         if not formats:
             await sent_message.edit_text("فرمت قابل دانلودی برای این URL یافت نشد.")
             return
+        
+        # --- Store the URL in temp_url_storage and generate a short key ---
+        # Using chat_id and message_id ensures uniqueness for a given message and user
+        # This key will be used to retrieve the full URL later
+        temp_key = f"{message.chat.id}_{message.id}"
+        temp_url_storage[temp_key] = url
+        logger.info(f"Stored URL {url} with key {temp_key}")
 
         # Filter formats and prepare for buttons
         available_qualities = {} # Dict to store (quality_label: callback_data)
@@ -149,8 +164,9 @@ async def process_url_for_qualities(bot: Client, message: Message):
                 else:
                     quality_label += " [اندازه نامشخص]" # If size is unknown
 
-                # callback_data format: type_of_download=format_id=ext=original_url
-                callback_data = f"download_quality={format_id}={ext}={url}"
+                # callback_data format: dl_q=FORMAT_ID=EXT=TEMP_KEY
+                # 'dl_q' is a shortened prefix for 'download_quality' to save bytes
+                callback_data = f"dl_q={format_id}={ext}={temp_key}"
                 available_qualities[quality_label] = callback_data
 
         if not available_qualities:
@@ -176,13 +192,24 @@ async def process_url_for_qualities(bot: Client, message: Message):
         await sent_message.edit_text(f"هنگام پردازش لینک شما خطایی رخ داد: {e}")
 
 # --- Handler for quality selection Callback Queries ---
-@Client.on_callback_query(filters.regex(r"^download_quality="))
+@Client.on_callback_query(filters.regex(r"^dl_q=")) # <<<--- Regex changed to 'dl_q='
 async def ddl_call_back(bot: Client, update: CallbackQuery):
     logger.info(f"Callback received: {update.data}")
     cb_data = update.data
 
-    # Parse callback_data: download_quality=FORMAT_ID=EXT=URL
-    _, youtube_dl_format, youtube_dl_ext, youtube_dl_url = cb_data.split("=", 3)
+    # parsing callback_data: dl_q=FORMAT_ID=EXT=TEMP_KEY
+    _, youtube_dl_format, youtube_dl_ext, temp_key = cb_data.split("=", 3)
+
+    # --- Retrieve the original URL from temp_url_storage ---
+    youtube_dl_url = temp_url_storage.get(temp_key)
+    if not youtube_dl_url:
+        await update.message.edit_text("خطا: لینک اصلی پیدا نشد یا منقضی شده است. لطفاً دوباره امتحان کنید یا لینک جدیدی ارسال کنید.")
+        return
+    
+    # Optional: Delete the URL from storage if you want it to be used only once
+    # However, if a user might want to download multiple qualities from the same message,
+    # don't delete it. Consider a scheduled cleanup or a persistent DB.
+    # del temp_url_storage[temp_key] # Consider if you need to retain for other downloads
 
     user = await bot.get_me()
     mention = user["mention"]
@@ -196,7 +223,6 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
         os.makedirs(tmp_directory_for_each_user)
 
     # Output filename template for yt-dlp
-    # %(title)s - video title, %(ext)s - file extension
     output_template = os.path.join(tmp_directory_for_each_user, '%(title)s.%(ext)s')
 
     ydl_opts_download = {
@@ -219,9 +245,7 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
     downloaded_file_path = None
     try:
         with youtube_dl.YoutubeDL(ydl_opts_download) as ydl:
-            # extract_info with download=True will download the file
             info_dict = ydl.extract_info(youtube_dl_url, download=True)
-            # yt-dlp returns the actual path after download and processing
             downloaded_file_path = ydl.prepare_filename(info_dict)
             download_success = True
     except youtube_dl.DownloadError as e:
@@ -253,8 +277,6 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
         else:
             upload_start_time = time.time() # Start time for upload
 
-            # Determine send type (audio/video/file) based on file extension
-            # You might want to make this logic more sophisticated, e.g., using MIME types.
             if downloaded_file_path.endswith(('.mp3', '.ogg', '.wav', '.m4a')):
                 tg_send_type = "audio"
             elif downloaded_file_path.endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov')):
@@ -269,7 +291,6 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                 logger.warning(f"Could not generate thumbnail with Gthumb01: {e}")
                 thumb_image_path = None # Set to None if error occurs
 
-            # --- Upload logic ---
             try:
                 if tg_send_type == "audio":
                     duration = await Mdata03(downloaded_file_path)
@@ -303,7 +324,6 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                     )
                 elif tg_send_type == "vm": # Video Message (circular video)
                     width, duration = await Mdata02(downloaded_file_path)
-                    # Gthumb02 is likely for video message thumbnail
                     thumb_vm_path = await Gthumb02(bot, update, duration, downloaded_file_path)
                     await bot.send_video_note(
                         chat_id=update.message.chat.id,
@@ -321,7 +341,6 @@ async def ddl_call_back(bot: Client, update: CallbackQuery):
                     )
                 elif tg_send_type == "video":
                     width, height, duration = await Mdata01(downloaded_file_path)
-                    # Gthumb02 is likely for video thumbnail
                     thumb_video_path = await Gthumb02(bot, update, duration, downloaded_file_path)
                     await bot.send_video(
                         chat_id=update.message.chat.id,
@@ -428,23 +447,19 @@ async def yt_dlp_progress_hook(d: dict, bot: Client, chat_id: int, message_id: i
 
 # --- Bot initialization and execution ---
 if __name__ == "__main__":
-    # If you are using plugins, ensure the path is correct
     plugins_path = dict(root="plugins")
 
     app = Client(
-        "my_bot_session", # Arbitrary name for the bot session
+        "my_bot_session",
         bot_token=Config.TG_BOT_TOKEN,
         api_id=Config.APP_ID,
         api_hash=Config.API_HASH,
-        plugins=plugins_path # Loads plugins
+        plugins=plugins_path
     )
 
-    # Register handlers
-    # Handler for URL messages (starting with http/https)
     app.add_handler(MessageHandler(process_url_for_qualities, filters.regex(r"^(http|https)://[^\s/$.?#].[^\s]*$") & filters.private))
-    # Handler for Callback Queries (when user clicks on a quality button)
-    app.add_handler(CallbackQueryHandler(ddl_call_back, filters.regex(r"^download_quality=")))
+    app.add_handler(CallbackQueryHandler(ddl_call_back, filters.regex(r"^dl_q="))) # <<<--- Regex changed here
 
     logger.info("ربات در حال شروع به کار است...")
-    app.run() # Run the bot
+    app.run()
     logger.info("ربات متوقف شد.")
